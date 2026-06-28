@@ -10,29 +10,40 @@
 # so Docker treats them as global build args (multi-stage scoping rule).
 ARG BASE_IMAGE=ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@sha256:f76a2ed0509570b1ce5380327c7ebe2e120e97f524e9271e145d2ea34c83ba5e
 
-# ── Stage 0: binstall the pinned, prebuilt nemo-relay CLI (no source build) ────
+# ── Stage 0: fetch the pinned, prebuilt nemo-relay CLI (no source build) ───────
 # Upstream publishes musl-static CLI release assets (zero glibc linkage), so the
 # binary loads on the glibc-2.35 runtime regardless of build host — no in-base-
-# image compile needed. cargo-binstall auto-detects host arch + libc and resolves
-# the matching release asset, so no architecture is named here; the build is
-# always native (openshell builds with no --platform), so host arch == target.
+# image compile needed. Download the pinned release asset directly instead of
+# resolving it through cargo-binstall: the latter calls the GitHub Releases API,
+# which is often unauthenticated/rate-limited inside cold sandbox builds.
+# OpenShell builds natively (no --platform), so TARGETARCH matches the host.
 # 0.3.0 includes the S3 ATIF export plugin (NVIDIA/NeMo-Relay#163), pulled in
 # unconditionally via the cli crate's `object-store` feature.
 FROM ${BASE_IMAGE} AS nemo-relay-builder
 ARG NEMO_RELAY_CLI_VERSION=0.3.0
-# PATH includes cargo's bin dir so the install script's --self-install step
-# finds it (silences its cosmetic "path is missing /root/.cargo/bin" warning)
-# and cargo-binstall resolves by name on the next line.
-RUN export PATH="/root/.cargo/bin:$PATH" \
-    && apt-get update -qq \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -L --proto '=https' --tlsv1.2 -sSf \
-       https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
-    && cargo-binstall --no-confirm --strategies crate-meta-data \
-       --install-path /out/bin "nemo-relay-cli@${NEMO_RELAY_CLI_VERSION}"
-# --strategies crate-meta-data: only resolve the crate's own [metadata.binstall]
-# release asset; fail loud (no silent source recompile) if none matches the host.
+ARG TARGETARCH
+COPY certs/ /usr/local/share/ca-certificates/
+RUN set -eux; \
+    apt-get update -qq; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
+    update-ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+      amd64|x86_64) \
+        relay_target="x86_64-unknown-linux-musl"; \
+        relay_sha256="7828a533f2ccde8eed9a37986782b557a9a5fb9614e67b256fa335813c91cf63" ;; \
+      arm64|aarch64) \
+        relay_target="aarch64-unknown-linux-musl"; \
+        relay_sha256="7819e25bb4f0301ec6e43bcb1eac7ae14a0e8ae9d0360b1875846d6a9f64bc49" ;; \
+      *) echo "Unsupported nemo-relay-cli build architecture: ${TARGETARCH:-$(dpkg --print-architecture)}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /out/bin; \
+    curl -L --proto '=https' --tlsv1.2 -sSf \
+      -o /out/bin/nemo-relay \
+      "https://github.com/NVIDIA/NeMo-Relay/releases/download/${NEMO_RELAY_CLI_VERSION}/nemo-relay-cli-${relay_target}-${NEMO_RELAY_CLI_VERSION}"; \
+    echo "${relay_sha256}  /out/bin/nemo-relay" | sha256sum -c -; \
+    chmod 0755 /out/bin/nemo-relay; \
+    /out/bin/nemo-relay --version
 # Produces /out/bin/nemo-relay (musl-static; runs on any glibc/musl Linux)
 
 # ── Main sandbox image ────────────────────────────────────────────────────────
